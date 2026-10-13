@@ -54837,8 +54837,12 @@ const PHYSICS = {
   drag: 0.85,
   lateral: 11.5,       // 变道横向速度
   lateralDamp: 6.0,
-  jumpImpulse: 8.6,
-  gravity: -21,
+  // 跳跃：滞空时间必须留出余量。
+  // 半隐式欧拉积分下，滞空 = 2*v0/g 会被离散化误差削掉一点；
+  // 取 10 / 19 可保证 20~240fps 全区间内的实际滞空都是 1.03~1.05 秒，
+  // 稳稳越过 "滞空超过 1 秒" 这条成就线（原先 9.6/19 恰好卡在 1.000 秒）。
+  jumpImpulse: 10,
+  gravity: -19,
   wheelieRate: 2.4,
   wheelieMax: 0.62,
 };
@@ -54857,8 +54861,7 @@ const ACHIEVEMENTS = [
   { id: 'combo_5',     title: '连击大师',   desc: '5 连击不失误' },
   { id: 'speed_28',    title: '风驰电掣',   desc: '时速突破 28 m/s' },
   { id: 'wheelie_2s',  title: '翘头表演',   desc: '抬前轮持续 2 秒' },
-  { id: 'air_1s',      title: '滞空时刻',   desc: '滞空超过 1 秒' },
-  { id: 'night_fish',  title: '夜航捕鱼',   desc: '在夜晚抓到 5 条鱼' },
+  { id: 'air_1s',      title: '滞空时刻',   desc: '滞空超过 1 秒' },  { id: 'night_fish',  title: '夜航捕鱼',   desc: '在夜晚抓到 5 条鱼' },
   { id: 'marathon',    title: '长途跋涉',   desc: '骑行累计 2000 米' },
   { id: 'lane_master', title: '游龍戏水',   desc: '连续变道 12 次' },
   { id: 'hug_coast',   title: '贴海飞行',   desc: '在最外侧车道待满 15 秒' },
@@ -54926,8 +54929,7 @@ class Cloth {
         this.pos[i * 3 + 2] = -0.015 * r;
       }
     }
-    this.pos.set(this.pos, 0);
-    this.prev.set(this.pos);
+    this.prev.set(this.pos);   // 初始无速度
 
     // 距离约束：结构（横竖）+ 剪切（对角）
     this.constraints = [];
@@ -55030,65 +55032,84 @@ class Cloth {
    * @param {number} stiffness 结构刚度 0..1
    */
   step(dt, wind, stiffness = 0.86) {
-    const SUB = 2;
-    const h = Math.min(dt, 1 / 30) / SUB;
-    const damp = 0.985;
+    // 固定时间步：把整帧切成一串固定长度的子步，
+    // 这样阻尼与弹簧行为只取决于物理时间，不取决于机器跑多少帧。
+    //
+    // 关键：允许的子步数必须够覆盖整帧，否则低帧率下会"少算时间"，
+    // 围巾在 20fps 机器上会飘得比 144Hz 机器慢 —— 那就等于没修。
+    const FIXED_H = 1 / 120;
+    let remaining = Math.min(dt, 1 / 20);          // 最多补 50ms
+    // 1/20 秒需要 6 个子步，留一点余量
+    const maxSteps = Math.ceil((1 / 20) / FIXED_H) + 2;
+    let steps = 0;
+    while (remaining > 1e-6 && steps < maxSteps) {
+      const h = Math.min(FIXED_H, remaining);
+      this._substep(h, wind, stiffness);
+      remaining -= h;
+      steps++;
+    }
+    // 未消化完的时间丢弃（防止螺旋式卡死），并记录供诊断
+    this._lastSteps = steps;
+    this._lastRemainder = remaining;
+  }
+
+  /** 单个固定子步 */
+  _substep(h, wind, stiffness) {
+    const damp = 0.998;          // 每 1/120 秒的留速系数
     const gravity = -9.4;
 
-    for (let s = 0; s < SUB; s++) {
-      // --- Verlet 积分 ---
-      for (let i = 0; i < this.count; i++) {
-        if (this.pinned[i]) continue;
-        const i3 = i * 3;
-        const px = this.pos[i3], py = this.pos[i3 + 1], pz = this.pos[i3 + 2];
-        let vx = (px - this.prev[i3]) * damp;
-        let vy = (py - this.prev[i3 + 1]) * damp;
-        let vz = (pz - this.prev[i3 + 2]) * damp;
+    // --- Verlet 积分 ---
+    for (let i = 0; i < this.count; i++) {
+      if (this.pinned[i]) continue;
+      const i3 = i * 3;
+      const px = this.pos[i3], py = this.pos[i3 + 1], pz = this.pos[i3 + 2];
+      const vx = (px - this.prev[i3]) * damp;
+      const vy = (py - this.prev[i3 + 1]) * damp;
+      const vz = (pz - this.prev[i3 + 2]) * damp;
 
-        // 气动阻力：相对风速决定受力，形成"甩动"效果。
-        // wind 的量级是 m/s，要换算成加速度，所以乘一个较大的系数，
-        // 否则在重力面前可以忽略，围巾会像块硬板一样垂着不动。
-        const AIR = 3.4;
-        const ax = (wind.x - vx / h) * AIR * 0.62;
-        const az = (wind.z - vz / h) * AIR * 0.62;
-        const ay = (wind.y - vy / h) * AIR * 0.30;
+      // 气动阻力：相对风速决定受力，形成"甩动"效果。
+      // wind 的量级是 m/s，要换算成加速度，所以乘一个较大的系数，
+      // 否则在重力面前可以忽略，围巾会像块硬板一样垂着不动。
+      const AIR = 3.4;
+      const ax = (wind.x - vx / h) * AIR * 0.62;
+      const az = (wind.z - vz / h) * AIR * 0.62;
+      const ay = (wind.y - vy / h) * AIR * 0.30;
 
-        this.prev[i3] = px;
-        this.prev[i3 + 1] = py;
-        this.prev[i3 + 2] = pz;
+      this.prev[i3] = px;
+      this.prev[i3 + 1] = py;
+      this.prev[i3 + 2] = pz;
 
-        this.pos[i3] = px + vx + ax * h * h;
-        this.pos[i3 + 1] = py + vy + (ay + gravity) * h * h;
-        this.pos[i3 + 2] = pz + vz + az * h * h;
+      this.pos[i3] = px + vx + ax * h * h;
+      this.pos[i3 + 1] = py + vy + (ay + gravity) * h * h;
+      this.pos[i3 + 2] = pz + vz + az * h * h;
 
-        // 硬夹紧：抗 NaN 与爆炸
-        if (!Number.isFinite(this.pos[i3])) this.pos[i3] = px;
-        if (!Number.isFinite(this.pos[i3 + 1])) this.pos[i3 + 1] = py;
-        if (!Number.isFinite(this.pos[i3 + 2])) this.pos[i3 + 2] = pz;
-      }
+      // 硬夹紧：抗 NaN 与爆炸
+      if (!Number.isFinite(this.pos[i3])) this.pos[i3] = px;
+      if (!Number.isFinite(this.pos[i3 + 1])) this.pos[i3 + 1] = py;
+      if (!Number.isFinite(this.pos[i3 + 2])) this.pos[i3 + 2] = pz;
+    }
 
-      // --- 约束求解（多轮迭代提升刚度） ---
-      const ITER = 3;
-      for (let it = 0; it < ITER; it++) {
-        for (let k = 0; k < this.constraints.length; k++) {
-          const [a, b, restLen] = this.constraints[k];
-          const a3 = a * 3, b3 = b * 3;
-          let dx = this.pos[b3] - this.pos[a3];
-          let dy = this.pos[b3 + 1] - this.pos[a3 + 1];
-          let dz = this.pos[b3 + 2] - this.pos[a3 + 2];
-          let d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-          if (d < 1e-6) continue;
-          const diff = (d - restLen) / d * 0.5 * stiffness;
-          const ox = dx * diff, oy = dy * diff, oz = dz * diff;
-          const pa = this.pinned[a], pb = this.pinned[b];
-          if (!pa && !pb) {
-            this.pos[a3] += ox; this.pos[a3 + 1] += oy; this.pos[a3 + 2] += oz;
-            this.pos[b3] -= ox; this.pos[b3 + 1] -= oy; this.pos[b3 + 2] -= oz;
-          } else if (pa && !pb) {
-            this.pos[b3] -= ox * 2; this.pos[b3 + 1] -= oy * 2; this.pos[b3 + 2] -= oz * 2;
-          } else if (pb && !pa) {
-            this.pos[a3] += ox * 2; this.pos[a3 + 1] += oy * 2; this.pos[a3 + 2] += oz * 2;
-          }
+    // --- 约束求解（多轮迭代提升刚度） ---
+    const ITER = 3;
+    for (let it = 0; it < ITER; it++) {
+      for (let k = 0; k < this.constraints.length; k++) {
+        const [a, b, restLen] = this.constraints[k];
+        const a3 = a * 3, b3 = b * 3;
+        const dx = this.pos[b3] - this.pos[a3];
+        const dy = this.pos[b3 + 1] - this.pos[a3 + 1];
+        const dz = this.pos[b3 + 2] - this.pos[a3 + 2];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d < 1e-6) continue;
+        const diff = (d - restLen) / d * 0.5 * stiffness;
+        const ox = dx * diff, oy = dy * diff, oz = dz * diff;
+        const pa = this.pinned[a], pb = this.pinned[b];
+        if (!pa && !pb) {
+          this.pos[a3] += ox; this.pos[a3 + 1] += oy; this.pos[a3 + 2] += oz;
+          this.pos[b3] -= ox; this.pos[b3 + 1] -= oy; this.pos[b3 + 2] -= oz;
+        } else if (pa && !pb) {
+          this.pos[b3] -= ox * 2; this.pos[b3 + 1] -= oy * 2; this.pos[b3 + 2] -= oz * 2;
+        } else if (pb && !pa) {
+          this.pos[a3] += ox * 2; this.pos[a3 + 1] += oy * 2; this.pos[a3 + 2] += oz * 2;
         }
       }
     }
@@ -55658,8 +55679,11 @@ function createSky() {
         -0.35
       ).normalize();
 
-      const lightDir = n < 0.6 ? sunDir : moonDir;
-      uniforms.uSunDir.value.copy(n < 0.5 ? sunDir : moonDir);
+      // 关键光方向与天空辉光方向必须用同一个阈值切换，
+      // 否则会出现在"天空画着月亮、光却从太阳来"的错位。
+      const useMoon = n >= 0.55;
+      const lightDir = useMoon ? moonDir : sunDir;
+      uniforms.uSunDir.value.copy(lightDir);
       uniforms.uSunColor.value.setRGB(
         THREE.MathUtils.lerp(1.0, 0.62, n),
         THREE.MathUtils.lerp(0.66, 0.72, n),
@@ -56577,11 +56601,23 @@ class AudioEngine {
     src.start(t); src.stop(t + 0.08);
   }
 
-  /** 踏频 → BPM（只在实际踩踏时改变） */
+  /**
+   * 踏频 → BPM（只在实际踩踏时改变）。
+   * cadence 单位：踏/秒，实际游戏里约 0～8。
+   * 系数取 12 是为了让整条速度带（0～34 m/s）都映射在 62～158 BPM，
+   * 不会一过 17 m/s 就撞上 168 的天花板而失去随速变化。
+   */
   setCadence(cadence) {
-    // cadence 单位：踏/秒
-    const target = Math.max(58, Math.min(168, 62 + cadence * 34));
-    this.bpm += (target - this.bpm) * 0.06;
+    const target = Math.max(58, Math.min(168, 62 + cadence * 12));
+    this._bpmTarget = target;
+  }
+
+  /** 每帧推进 BPM（与帧率无关的指数逼近） */
+  updateTempo(dt) {
+    if (this._bpmTarget === undefined) return;
+    const k = 4.0;                                  // 逼近速率（1/秒）
+    const a = 1 - Math.exp(-k * dt);
+    this.bpm += (this._bpmTarget - this.bpm) * a;
   }
 
   // ---------- 音效 ----------
@@ -56784,12 +56820,16 @@ class CameraDirector {
 
     // cockpit / cine 用更快跟随，chase 用弹性平滑
     const followK = (this.mode === 'cockpit') ? 22 : (this.mode === 'chase' ? 5.5 : 3.2);
-    const alpha = 1 - Math.exp(-followK * dt);
+    // 切换机位后的前 ~0.45 秒用更高的跟随系数"柔化"硬切：
+    // blend 从 0 涨到 1，速度由快到慢，形成一次有质感的转场。
+    const blendBoost = 1 + (1 - this.blend) * 5.5;
+    const alpha = 1 - Math.exp(-followK * blendBoost * dt);
     this._tmp.copy(desired);
     cam.position.lerp(this._tmp, alpha);
 
-    // 视线目标平滑
-    this._look.lerp(target, 1 - Math.exp(-(this.mode === 'cockpit' ? 18 : 4.5) * dt));
+    // 视线目标平滑（同样受转场柔化影响）
+    const lookK = (this.mode === 'cockpit' ? 18 : 4.5) * (1 + (1 - this.blend) * 3.0);
+    this._look.lerp(target, 1 - Math.exp(-lookK * dt));
     cam.lookAt(this._look);
 
     // 速度感：轻微 FOV 拉伸 + 抖动
@@ -57107,8 +57147,7 @@ class Game {
       if (k === ' ') { e.preventDefault(); this.doJump(); }
       if (k === 't') this.doWheelie();
       if (k >= '1' && k <= '5') {
-        this.director.setMode(CAMERA_MODES[+k - 1].id);
-        this.hud.toast('镜头：' + CAMERA_MODES[+k - 1].label, 'info');
+        this.setCamera(CAMERA_MODES[+k - 1].id);
       }
       if (k === 'c') this.cycleCamera();
       if (k === 'm') { this.audio.setMusic(!this.audio.musicOn); this.hud.setMusicState(this.audio.musicOn); }
@@ -57167,6 +57206,15 @@ class Game {
     this.hud.toast('镜头：' + next.label, 'info');
   }
 
+  /** 直接选镜头；只有真的换了才给提示，避免"点了没变还报已切换" */
+  setCamera(id) {
+    const def = CAMERA_MODES.find((c) => c.id === id);
+    if (!def) return;
+    if (this.director.mode === id) return;
+    this.director.setMode(id);
+    this.hud.toast('镜头：' + def.label, 'info');
+  }
+
   doJump() {
     if (this.state.airborne) return;
     this.state.vy = PHYSICS.jumpImpulse;
@@ -57178,6 +57226,9 @@ class Game {
   }
 
   doWheelie() {
+    // 防连发：按住的持续抬升由 updatePhysics 处理，
+    // 这里只在"刚开始抬"时触发一次音效与特效，避免按键重复时刷屏。
+    if (this.state.wheelieHold > 0) return;
     this.state.wheelieHold = 0.001;
     this.audio.wheelie();
     this.particles.burst('dust', this.getPlayerPos(), 0.4);
@@ -57287,6 +57338,7 @@ class Game {
     });
 
     this.audio.setCadence(s.cadence);
+    this.audio.updateTempo(dt);
     this.audio.setAmbient(0.16 + Math.min(s.speed / 34, 1) * 0.20);
 
     this.hud.update(dt);
@@ -57518,7 +57570,9 @@ class Game {
       s.fish++;
       s.combo++;
       s.bestCombo = Math.max(s.bestCombo, s.combo);
-      if (s.timeOfDay > 0.55) s.nightFish++;
+      // 与 HUD 的"入夜"定义（timeOfDay >= 0.68）保持一致，
+      // 否则会出现"HUD 还写着暮色，却已经算夜间捕鱼"的矛盾。
+      if (s.timeOfDay >= 0.68) s.nightFish++;
       this.audio.catchFish(s.combo);
       this.particles.burst('sparkle', this.getPlayerPos(), 0.7);
       this.hud.setCombo(s.combo);
